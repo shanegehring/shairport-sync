@@ -66,6 +66,26 @@
 #define INETx_ADDRSTRLEN INET_ADDRSTRLEN
 #endif
 
+
+// DACP Daemon Port
+#define DACPD_PORT 3391
+
+// DACP information
+typedef  struct {
+  char *dacp_id;
+  char *active_remote;
+} dacp_info_t;
+
+// DACPD comm channel
+typedef struct  {
+  int sockfd;
+  struct sockaddr_in si;
+} dacpd_t;
+
+// Global reference to dacpd channel and info
+static dacp_info_t dacp_info;
+static dacpd_t *dacpd;
+
 enum rtsp_read_request_response {
   rtsp_read_request_response_ok,
   rtsp_read_request_response_shutdown_requested,
@@ -100,6 +120,30 @@ typedef struct {
 
 static rtsp_conn_info *playing_conn = NULL; // the data structure representing the connection that has the player.
 static rtsp_conn_info **conns = NULL;
+
+// Creates new DACPD comm channel
+static dacpd_t* dacpd_new(void) {
+
+  // Allocate new struct 
+  dacpd_t *dacpd = (dacpd_t *)malloc(sizeof(dacpd_t));
+  if (dacpd == NULL) {
+    debug(1, "FATAL: Cannot allocate dacpd struct");
+    return NULL;
+  }
+
+  // Create and init the socket 
+  dacpd->sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+  memset(&dacpd->si, 0, sizeof(dacpd->si));
+  dacpd->si.sin_family = AF_INET;
+  dacpd->si.sin_port = htons(DACPD_PORT);
+  inet_aton("127.0.0.1", &dacpd->si.sin_addr);
+
+  // Debug
+  debug(1, "New DACPD comm channel created");
+
+  return dacpd;
+
+}
 
 void memory_barrier() {
   pthread_mutex_lock(&barrier_mutex);
@@ -427,42 +471,52 @@ static void msg_free(rtsp_message *msg) {
 }
 
 static void dacp_update_params(char *dacp_id, char *active_remote) {
-  static struct {
-    char *dacp_id;
-    char *active_remote;
-  } p;
 
-  static int sockfd;
-  if (sockfd == 0) 
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (dacp_id == NULL || active_remote == NULL)
+  if (dacpd == NULL) {
+    dacpd = dacpd_new();
+  }
+  if (dacp_id == NULL || active_remote == NULL) {
     return;
+  }
 
   int changed = 0;
 
-  if (p.dacp_id == NULL || strcmp(p.dacp_id, dacp_id)) 
+  if (dacp_info.dacp_id == NULL || strcmp(dacp_info.dacp_id, dacp_id)) {
     changed++;
-  if (p.active_remote == NULL || strcmp(p.active_remote, active_remote)) 
+  }
+  if (dacp_info.active_remote == NULL || strcmp(dacp_info.active_remote, active_remote)) {
     changed++;
+  }
   
   if (changed) {
-    if (p.dacp_id) free(p.dacp_id);
-    if (p.active_remote) free(p.active_remote);
-    p.dacp_id = strdup(dacp_id);
-    p.active_remote = strdup(active_remote);
+    if (dacp_info.dacp_id) free(dacp_info.dacp_id);
+    if (dacp_info.active_remote) free(dacp_info.active_remote);
+    dacp_info.dacp_id = strdup(dacp_id);
+    dacp_info.active_remote = strdup(active_remote);
 
-    struct sockaddr_in si; 
-    memset(&si, 0, sizeof(si));
-    si.sin_family = AF_INET;
-    si.sin_port = htons(3391);
-    inet_aton("127.0.0.1", &si.sin_addr);
-
-    char *s = (char *)malloc(strlen(p.dacp_id) + strlen(p.active_remote) + 128);
-    sprintf(s, "resolve,iTunes_Ctrl_%s,%s", p.dacp_id, p.active_remote);
-    debug(1, "DACP update: %s\n", s);
-    sendto(sockfd, s, strlen(s)+1, 0, (struct sockaddr *)&si, sizeof(si));
+    char *s = (char *)malloc(strlen(dacp_info.dacp_id) + strlen(dacp_info.active_remote) + 128);
+    sprintf(s, "dacp_open,iTunes_Ctrl_%s,%s", dacp_info.dacp_id, dacp_info.active_remote);
+    debug(1, "DACP update: %s", s);
+    sendto(dacpd->sockfd, s, strlen(s)+1, 0, (struct sockaddr *)&dacpd->si, sizeof(dacpd->si));
     free(s);
   }
+}
+
+static void dacp_notify_end_session(void) {
+
+  if (dacpd == NULL) {
+    dacpd = dacpd_new();
+  }
+
+  if (dacp_info.dacp_id) free(dacp_info.dacp_id);
+  if (dacp_info.active_remote) free(dacp_info.active_remote);
+  dacp_info.dacp_id = NULL;
+  dacp_info.active_remote = NULL;
+
+  char *msg = "dacp_close";
+  sendto(dacpd->sockfd, msg, strlen(msg)+1, 0, (struct sockaddr *)&dacpd->si, sizeof(dacpd->si));
+  debug(1, "DACP update: %s", msg);
+
 }
 
 static int msg_handle_line(rtsp_message **pmsg, char *line) {
@@ -512,8 +566,8 @@ static int msg_handle_line(rtsp_message **pmsg, char *line) {
  
     dacp_update_params(dacp_id, active_remote);
  
-    debug(1, "Active-Remote: %s\n", active_remote);
-    debug(1, "DACP-ID: %s\n", dacp_id);
+    debug(1, "Active-Remote: %s", active_remote);
+    debug(1, "DACP-ID: %s", dacp_id);
 
     char *cl = msg_get_header(msg, "Content-Length");
     if (cl)
@@ -1837,6 +1891,7 @@ static void *rtsp_conversation_thread_func(void *pconn) {
     //         "close RTSP connection.");
   // }
   debug(2, "RTSP conversation thread terminated.");
+  dacp_notify_end_session();
   //  please_shutdown = 0;
   return NULL;
 }
